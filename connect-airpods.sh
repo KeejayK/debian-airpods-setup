@@ -3,7 +3,15 @@
 set -euo pipefail
 IFS=$' \t\n'
 
-LOGFILE="${LOGFILE:-$HOME/.cache/connect-airpods.log}"
+if (( EUID != 0 )); then
+  echo "[ERROR] Please run with sudo"
+  exit 1
+fi
+
+CONF_FILE="/etc/bluetooth/main.conf"
+BACKUP_FILE="${CONF_FILE}.orig"
+
+LOGFILE="${LOGFILE:-/root/.cache/connect-airpods.log}"
 VERBOSE=0
 BACKOFF_DELAY=2
 MAX_RETRIES=3
@@ -29,17 +37,23 @@ log_info()  { echo "[INFO]  $*" | tee -a "$LOGFILE"; }
 log_error() { echo "[ERROR] $*" >&2 | tee -a "$LOGFILE"; }
 debug()     { (( VERBOSE )) && echo "[DEBUG] $*" | tee -a "$LOGFILE"; }
 
+if command -v systemctl &>/dev/null; then
+  BT_RESTART_CMD=(systemctl restart bluetooth)
+else
+  BT_RESTART_CMD=(/etc/init.d/bluetooth restart)
+fi
+
 cleanup() {
+  if [[ -f "$BACKUP_FILE" ]]; then
+    log_info "Restoring original Bluetooth config…"
+    mv "$BACKUP_FILE" "$CONF_FILE"
+    log_info "Restarting Bluetooth service after config restore…"
+    "${BT_RESTART_CMD[@]}"
+  fi
   debug "Cleaning up…"
   pkill -P $$ bluetoothctl &>/dev/null || true
 }
 trap cleanup EXIT
-
-if command -v systemctl &>/dev/null; then
-  BT_RESTART_CMD=(sudo systemctl restart bluetooth)
-else
-  BT_RESTART_CMD=(sudo /etc/init.d/bluetooth restart)
-fi
 
 while (( $# )); do
   case "$1" in
@@ -48,7 +62,7 @@ while (( $# )); do
     --timeout=*)   SCAN_TIMEOUT="${1#*=}"; shift ;;
     --config=*)    CONFIG_FILE="${1#*=}"; shift ;;
     -h|--help)     usage ;;
-    *) echo "Unknown option: $1"; usage ;;
+    *) echo "[ERROR] Unknown option: $1"; usage ;;
   esac
 done
 
@@ -61,6 +75,30 @@ if [[ -n "$CONFIG_FILE" ]]; then
     exit 1
   fi
 fi
+
+backup_and_patch_conf() {
+  if [[ ! -f "$BACKUP_FILE" ]]; then
+    log_info "Backing up $CONF_FILE → $BACKUP_FILE"
+    cp "$CONF_FILE" "$BACKUP_FILE"
+  else
+    debug "Backup already exists, skipping"
+  fi
+
+  if grep -Eq '^[[:space:]]*#?[[:space:]]*ControllerMode' "$CONF_FILE"; then
+    log_info "Patching existing ControllerMode to 'bredr'"
+    sed -i 's|^[[:space:]]*#\?[[:space:]]*ControllerMode.*|ControllerMode = bredr|' "$CONF_FILE"
+  else
+    log_info "Appending ControllerMode = bredr to end of config"
+    echo -e "\nControllerMode = bredr" >> "$CONF_FILE"
+  fi
+}
+
+restore_conf() {
+  if [[ -f "$BACKUP_FILE" ]]; then
+    log_info "Restoring original Bluetooth config…"
+    mv "$BACKUP_FILE" "$CONF_FILE"
+  fi
+}
 
 with_retry() {
   local fn=$1; shift
@@ -83,22 +121,18 @@ restart_bt() {
 
 ensure_adapter() {
   log_info "Ensuring Bluetooth adapter is powered…"
-
   bluetoothctl power on &>/dev/null || debug "Failed to power on adapter"
-
   set +e
   for i in {1..5}; do
-    out=$(bluetoothctl show 2>/dev/null)
-    if grep -q "Powered: yes" <<<"$out"; then
+    if bluetoothctl show | grep -q "Powered: yes"; then
       set -euo pipefail
       debug "Adapter is powered."
       return 0
     fi
-    debug "Adapter not powered yet; waiting… ($i/5)"
+    debug "Waiting for adapter… ($i/5)"
     sleep 1
   done
   set -euo pipefail
-
   log_error "Bluetooth adapter is not powered. Aborting."
   exit 1
 }
@@ -110,21 +144,18 @@ forget_airpods() {
     mac=$(awk '{print $2}' <<<"$entry")
     name=${entry#*"$mac" }
     log_info "Removing $name ($mac)"
-    bluetoothctl remove "$mac" \
+    bluetoothctl remove "$mac" &>/dev/null \
       && debug "Removed $mac" \
-      || debug "Failed to remove $mac (maybe already gone)"
+      || debug "Failed to remove $mac"
   done
 }
 
 scan_airpods() {
   log_info "Scanning for AirPods for $SCAN_TIMEOUT seconds…"
-  bluetoothctl scan on &
+  bluetoothctl scan on &>/dev/null &
   SCAN_PID=$!
   sleep "$SCAN_TIMEOUT"
-
-  if ! bluetoothctl scan off; then
-    debug "Warning: failed to stop discovery—continuing anyway"
-  fi
+  bluetoothctl scan off &>/dev/null || debug "scan off failed"
   kill "$SCAN_PID" &>/dev/null || true
 
   mapfile -t RAW < <(bluetoothctl devices | grep -i "AirPod" || true)
@@ -141,13 +172,11 @@ scan_airpods() {
     NAMES+=("$name")
   done
 
-  echo
-  echo "Found AirPods:"
+  echo -e "\nFound AirPods:"
   for i in "${!MACS[@]}"; do
     printf "  [%d] %s  (%s)\n" "$((i+1))" "${MACS[$i]}" "${NAMES[$i]}"
   done
   echo
-
   [[ "$MODE" == "scan-only" ]] && exit 0
 
   while true; do
@@ -162,36 +191,26 @@ scan_airpods() {
   done
 }
 
-pair_device()      { log_info "Pairing       $DEVICE_MAC…";   bluetoothctl pair    "$DEVICE_MAC"; }
-trust_device()     { log_info "Trusting      $DEVICE_MAC…";   bluetoothctl trust   "$DEVICE_MAC"; }
-disconnect_device(){ log_info "Disconnecting $DEVICE_MAC…";   bluetoothctl disconnect "$DEVICE_MAC" \
-                         && debug "Disconnected" \
-                         || debug "No prior connection to disconnect"; }
+pair_device()  { log_info "Pairing       $DEVICE_MAC…"; bluetoothctl pair  "$DEVICE_MAC"; }
+trust_device() { log_info "Trusting      $DEVICE_MAC…"; bluetoothctl trust "$DEVICE_MAC"; }
+
 connect_device() {
   log_info "Connecting    $DEVICE_MAC…"
-  disconnect_device
-
-  for i in {1..5}; do
-    if bluetoothctl info "$DEVICE_MAC" | grep -q "ServicesResolved: yes"; then
-      debug "ServicesResolved=yes"
-      break
-    fi
-    debug "Waiting for services to resolve… ($i/5)"
-    sleep 1
-  done
-
   bluetoothctl connect "$DEVICE_MAC"
 }
 
 main() {
+  backup_and_patch_conf
   restart_bt
   ensure_adapter
   forget_airpods
   scan_airpods
-
   with_retry pair_device
   trust_device
   with_retry connect_device
+
+  restore_conf
+  restart_bt
 
   log_info "✔ Successfully connected to $DEVICE_NAME [$DEVICE_MAC]"
 }
