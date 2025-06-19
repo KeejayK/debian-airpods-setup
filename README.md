@@ -8,9 +8,6 @@ A simple script automating the forgetting, pairing, and connecting your AirPods 
 - Ensure `ControllerMode = bredr` in Bluetooth config (with backup)
 - Restart Bluetooth (SystemD or SysV)
 - Interactive scan prompt
-- Configurable device name & timeout
-- `--remove-only` mode
-- Colorized, numbered progress messages
 
 ## Installation
 
@@ -19,26 +16,20 @@ A simple script automating the forgetting, pairing, and connecting your AirPods 
 git clone https://github.com/KeejayK/debian-airpods-setup.git
 cd airpods-connector
 
-# Install script
-./install.sh
+# Mark it executable
+chmod +x connect-airpods.sh
+
+# Move into PATH
+sudo mv connect-airpods.sh /usr/local/bin/
 ```
 
 ## Usage
 
 ```bash
-# Show help
-connect-airpods.sh --help
+# Default: Forget, scan, pair and connect
+sudo connect-airpods.sh
 
-# Default: forget, scan, pair & connect
-connect-airpods.sh
-
-# Forget only, then exit
-connect-airpods.sh --remove-only
-
-# Custom device name & timeout
-connect-airpods.sh --name "Keejay's Airpods" --timeout 15
-
-# Enable verbose logging
+# Enable verbose debugging
 connect-airpods.sh --verbose
 ```
 
@@ -48,4 +39,6 @@ connect-airpods.sh --verbose
 
 - Scan fails: Ensure your AirPods are in pairing mode (LED blinking).
 
-- Permission errors: You may need to run with sudo for config edits and service restarts.
+## Credits
+
+Manual pairing instructions (ControllerMode, scanning steps, etc.) were adapted from [aidos-dev’s GitHub Gist](https://gist.github.com/aidos-dev/b49078c1d8c6bb1621e4ac199d18213b).
